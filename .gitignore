@@ -1,0 +1,30 @@
+# Dataset (not committed – download separately)
+data/*.csv
+data/*.parquet
+data/*.h5
+data/*.hdf5
+data/*.npy
+data/*.npz
+
+# Model checkpoints
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.egg
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
