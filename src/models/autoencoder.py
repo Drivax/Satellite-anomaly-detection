@@ -188,7 +188,7 @@ class SatelliteAutoencoder:
         self
         """
         dataset = TensorDataset(self._to_tensor(X_train))
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         self.model.train()
         for epoch in range(self.epochs):

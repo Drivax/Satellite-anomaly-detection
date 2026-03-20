@@ -86,7 +86,7 @@ def add_rolling_features(df: pd.DataFrame, feature_cols: list,
         sigma = roll.std(ddof=1)
         df_out[f"{col}_roll_mean"] = mu
         df_out[f"{col}_roll_std"] = sigma
-        df_out[f"{col}_zscore"] = (df_out[col] - mu) / sigma.replace(0, np.nan)
+        df_out[f"{col}_zscore"] = (df_out[col] - mu) / sigma.replace(0, 1e-8)
 
     # Fill NaN values introduced by the rolling window with 0
     roll_cols = [c for c in df_out.columns if c not in df.columns]

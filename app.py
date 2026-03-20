@@ -85,12 +85,12 @@ def preprocess(df: pd.DataFrame):
 
 
 df_raw = load_data(n_samples, anomaly_ratio, int(seed))
-train, val, test, scaler, all_feature_cols = preprocess(df_raw)
+train, val, test, scaler, model_feature_cols = preprocess(df_raw)
 
-base_feature_cols = [c for c in FEATURE_COLUMNS if c in df_raw.columns]
-X_train = train[base_feature_cols].values
-X_val = val[base_feature_cols].values
-X_test = test[base_feature_cols].values
+# Use all preprocessed features (base + rolling) for model training
+X_train = train[model_feature_cols].values
+X_val = val[model_feature_cols].values
+X_test = test[model_feature_cols].values
 y_test = test["label"].values
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ if run_models:
         st.subheader("🤖 Autoencoder")
         with st.spinner("Training Autoencoder (50 epochs)…"):
             ae_model = SatelliteAutoencoder(
-                input_dim=len(base_feature_cols), epochs=50
+                input_dim=X_train.shape[1], epochs=50
             )
             ae_model.fit(X_train, X_val)
             ae_metrics = ae_model.evaluate(X_test, y_test)
