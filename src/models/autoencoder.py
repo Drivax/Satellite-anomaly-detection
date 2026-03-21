@@ -18,9 +18,9 @@ Anomaly threshold: 95th percentile of reconstruction error on the
 validation set. Samples with error above this threshold are anomalous.
 
 Training hyperparameters:
-  epochs     = 50
-  optimizer  = Adam (lr=1e-3)
-  batch_size = 128
+    epochs     = 120
+    optimizer  = Adam (lr=5e-4, weight_decay=1e-5)
+    batch_size = 128
 """
 
 import numpy as np
@@ -38,12 +38,14 @@ from pathlib import Path
 
 # Default hyperparameters
 INPUT_DIM = 20
-LATENT_DIM = 12
-HIDDEN_DIMS = (64, 32)
-EPOCHS = 50
+LATENT_DIM = 8
+HIDDEN_DIMS = (128, 64, 32)
+EPOCHS = 120
 BATCH_SIZE = 128
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 THRESHOLD_PERCENTILE = 95
+WEIGHT_DECAY = 1e-5
+EARLY_STOPPING_PATIENCE = 15
 
 
 class Autoencoder(nn.Module):
@@ -75,7 +77,7 @@ class Autoencoder(nn.Module):
         for h in hidden_dims:
             encoder_layers += [nn.Linear(prev_dim, h), nn.ReLU()]
             prev_dim = h
-        encoder_layers += [nn.Linear(prev_dim, latent_dim), nn.ReLU()]
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))  # no activation on latent
         self.encoder = nn.Sequential(*encoder_layers)
 
         # Decoder (mirror of encoder)
@@ -85,8 +87,6 @@ class Autoencoder(nn.Module):
             decoder_layers += [nn.Linear(prev_dim, h), nn.ReLU()]
             prev_dim = h
         decoder_layers.append(nn.Linear(prev_dim, input_dim))
-        # Sigmoid to keep outputs in [0, 1] (inputs are Min-Max normalised)
-        decoder_layers.append(nn.Sigmoid())
         self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,9 +116,14 @@ class SatelliteAutoencoder:
         Mini-batch size.
     lr : float
         Adam learning rate.
+    weight_decay : float
+        Adam weight decay for mild regularisation.
     threshold_percentile : int
         Percentile of validation reconstruction error used as anomaly
         threshold (default 95).
+    patience : int
+        Early stopping patience measured in epochs without validation
+        improvement.
     feature_weights : np.ndarray or None
         Per-feature weight vector for domain-weighted MSE loss.
         When None, all features are weighted equally (standard MSE).
@@ -134,14 +139,18 @@ class SatelliteAutoencoder:
         epochs: int = EPOCHS,
         batch_size: int = BATCH_SIZE,
         lr: float = LEARNING_RATE,
+        weight_decay: float = WEIGHT_DECAY,
         threshold_percentile: int = THRESHOLD_PERCENTILE,
+        patience: int = EARLY_STOPPING_PATIENCE,
         feature_weights: np.ndarray = None,
         device: str = None,
     ):
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
+        self.weight_decay = weight_decay
         self.threshold_percentile = threshold_percentile
+        self.patience = patience
         self.threshold_ = None
         self.train_losses_ = []
         self.val_losses_ = []
@@ -156,14 +165,27 @@ class SatelliteAutoencoder:
         self.model = Autoencoder(input_dim, hidden_dims, latent_dim).to(
             self.device
         )
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=5,
+        )
 
-        # Domain-weighted loss: per-feature weights for sensor criticality
+        # Domain-weighted loss: per-feature weights for sensor criticality.
+        # When the input is a flattened window (window_size * n_features),
+        # pass the base per-feature weights and set window_size so they
+        # are tiled automatically.
         if feature_weights is not None:
-            w = torch.tensor(feature_weights, dtype=torch.float32).to(
-                self.device
-            )
-            self.feature_weights_ = w / w.sum()  # normalize
+            w = torch.tensor(feature_weights, dtype=torch.float32)
+            # Tile weights across the window if input_dim is a multiple
+            n_base = len(feature_weights)
+            if input_dim > n_base and input_dim % n_base == 0:
+                w = w.repeat(input_dim // n_base)
+            w = (w / w.sum()).to(self.device)
+            self.feature_weights_ = w
         else:
             self.feature_weights_ = None
 
@@ -220,8 +242,12 @@ class SatelliteAutoencoder:
         dataset = TensorDataset(self._to_tensor(X_train))
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        self.model.train()
+        best_val_loss = float("inf")
+        best_state = None
+        epochs_without_improvement = 0
+
         for epoch in range(self.epochs):
+            self.model.train()
             epoch_loss = 0.0
             for (batch,) in loader:
                 self.optimizer.zero_grad()
@@ -236,6 +262,23 @@ class SatelliteAutoencoder:
             if X_val is not None:
                 val_loss = self._reconstruction_error(X_val).mean()
                 self.val_losses_.append(float(val_loss))
+                self.scheduler.step(val_loss)
+
+                if val_loss < best_val_loss - 1e-6:
+                    best_val_loss = float(val_loss)
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in self.model.state_dict().items()
+                    }
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                if epochs_without_improvement >= self.patience:
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
 
         # Calibrate anomaly threshold from validation set
         if X_val is not None:

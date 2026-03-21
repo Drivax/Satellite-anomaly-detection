@@ -54,7 +54,9 @@ SENSOR_CRITICALITY = {
 }
 
 
-def minmax_normalize(df: pd.DataFrame, feature_cols: list) -> tuple:
+def minmax_normalize(df: pd.DataFrame,
+                     feature_cols: list,
+                     scaler: MinMaxScaler = None) -> tuple:
     """
     Apply Min-Max normalization: x' = (x - x_min) / (x_max - x_min).
 
@@ -72,9 +74,12 @@ def minmax_normalize(df: pd.DataFrame, feature_cols: list) -> tuple:
     scaler : MinMaxScaler
         Fitted scaler (use to transform future data).
     """
-    scaler = MinMaxScaler()
+    scaler = scaler or MinMaxScaler()
     df_norm = df.copy()
-    df_norm[feature_cols] = scaler.fit_transform(df[feature_cols])
+    if hasattr(scaler, "n_features_in_"):
+        df_norm[feature_cols] = scaler.transform(df[feature_cols])
+    else:
+        df_norm[feature_cols] = scaler.fit_transform(df[feature_cols])
     return df_norm, scaler
 
 
@@ -118,9 +123,10 @@ def add_rolling_features(df: pd.DataFrame, feature_cols: list,
 
 
 def add_orbital_features(df: pd.DataFrame,
-                        orbital_period: int = ORBITAL_PERIOD_SAMPLES,
-                        eclipse_percentile: int = ECLIPSE_SNR_PERCENTILE
-                        ) -> pd.DataFrame:
+                         orbital_period: int = ORBITAL_PERIOD_SAMPLES,
+                         eclipse_percentile: int = ECLIPSE_SNR_PERCENTILE,
+                         start_index: int = 0,
+                         eclipse_threshold: float = None) -> pd.DataFrame:
     """
     Add cyclical orbital phase encoding and eclipse detection.
 
@@ -147,7 +153,8 @@ def add_orbital_features(df: pd.DataFrame,
     n = len(df_out)
 
     # Cyclical orbital phase encoding
-    time_in_orbit = np.arange(n) % orbital_period
+    time_in_orbit = (np.arange(start_index, start_index + n)
+                     % orbital_period)
     df_out["orbital_cos"] = np.cos(2 * np.pi * time_in_orbit / orbital_period)
     df_out["orbital_sin"] = np.sin(2 * np.pi * time_in_orbit / orbital_period)
 
@@ -155,10 +162,23 @@ def add_orbital_features(df: pd.DataFrame,
     snr_cols = [c for c in df_out.columns if c.startswith("snr_")]
     if snr_cols:
         mean_snr = df_out[snr_cols].mean(axis=1)
-        threshold = mean_snr.quantile(eclipse_percentile / 100)
+        threshold = eclipse_threshold
+        if threshold is None:
+            threshold = mean_snr.quantile(eclipse_percentile / 100)
         df_out["eclipse"] = (mean_snr < threshold).astype(float)
 
     return df_out
+
+
+def compute_eclipse_threshold(df: pd.DataFrame,
+                              eclipse_percentile: int = ECLIPSE_SNR_PERCENTILE
+                              ) -> float:
+    """Compute the eclipse threshold from training data only."""
+    snr_cols = [c for c in df.columns if c.startswith("snr_")]
+    if not snr_cols:
+        return None
+    mean_snr = df[snr_cols].mean(axis=1)
+    return float(mean_snr.quantile(eclipse_percentile / 100))
 
 
 def add_physics_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -282,11 +302,11 @@ def preprocess_pipeline(df: pd.DataFrame,
                          window: int = ROLLING_WINDOW) -> tuple:
     """
     Full preprocessing pipeline:
-      1. Min-Max normalization
-      2. Orbital phase encoding & eclipse detection
-      3. Physics-based feature derivation
-      4. Rolling feature computation
-      5. Chronological 70/15/15 split
+    1. Chronological split
+    2. Min-Max normalization fitted on train only
+    3. Orbital phase encoding & eclipse detection
+    4. Physics-based feature derivation
+    5. Rolling feature computation
 
     Parameters
     ----------
@@ -309,8 +329,20 @@ def preprocess_pipeline(df: pd.DataFrame,
     if feature_cols is None:
         feature_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
 
-    df_norm, scaler = minmax_normalize(df, feature_cols)
-    df_domain = add_orbital_features(df_norm)
+    train_raw, val_raw, test_raw = chronological_split(df)
+
+    # Fit scaler on NORMAL training data only so anomalies fall outside [0,1]
+    train_normal_mask = train_raw['label'] == 0
+    scaler = MinMaxScaler().fit(train_raw.loc[train_normal_mask, feature_cols])
+    df_norm, _ = minmax_normalize(df, feature_cols, scaler=scaler)
+
+    eclipse_threshold = compute_eclipse_threshold(
+        df_norm.iloc[:len(train_raw)]
+    )
+    df_domain = add_orbital_features(
+        df_norm,
+        eclipse_threshold=eclipse_threshold,
+    )
     df_domain = add_physics_features(df_domain)
     df_feat = add_rolling_features(df_domain, feature_cols, window=window)
     train, val, test = chronological_split(df_feat)
@@ -356,13 +388,70 @@ def generate_synthetic_dataset(n_samples: int = 120_000,
     trend = np.linspace(0, 0.5, n_samples)
     data[:, :3] += trend[:, None]
 
-    # Inject anomalies
+    # Inject anomalies as short temporal episodes rather than isolated points.
     n_anomalies = int(n_samples * anomaly_ratio)
-    anomaly_idx = rng.choice(n_samples, size=n_anomalies, replace=False)
     labels = np.zeros(n_samples, dtype=int)
-    labels[anomaly_idx] = 1
-    # Anomalies: large deviation from normal
-    data[anomaly_idx] += rng.uniform(3, 6, size=(n_anomalies, n_features))
+
+    feature_index = {
+        col: idx for idx, col in enumerate(FEATURE_COLUMNS[:n_features])
+    }
+    anomaly_types = ["thermal", "power", "rf", "attitude", "mixed"]
+    anomaly_probs = [0.25, 0.25, 0.20, 0.20, 0.10]
+
+    filled = 0
+    occupied = np.zeros(n_samples, dtype=bool)
+    while filled < n_anomalies:
+        remaining = n_anomalies - filled
+        seg_len = int(min(rng.integers(12, 36), remaining))
+        start = int(rng.integers(0, max(1, n_samples - seg_len)))
+        stop = min(n_samples, start + seg_len)
+        if occupied[start:stop].any():
+            continue
+
+        occupied[start:stop] = True
+        labels[start:stop] = 1
+        filled += stop - start
+
+        idx = np.arange(start, stop)
+        phase = np.linspace(0, 1, len(idx))
+        triangle = 1.0 - np.abs(2.0 * phase - 1.0)
+        smooth = np.sin(np.pi * phase)
+        anomaly_type = rng.choice(anomaly_types, p=anomaly_probs)
+
+        if anomaly_type == "thermal":
+            for col in ("temperature_1", "temperature_2", "temperature_3"):
+                if col in feature_index:
+                    data[idx, feature_index[col]] += rng.uniform(1.5, 3.0) * smooth
+        elif anomaly_type == "power":
+            for col in ("voltage_1", "voltage_2", "voltage_3"):
+                if col in feature_index:
+                    data[idx, feature_index[col]] -= rng.uniform(1.5, 2.5) * smooth
+            for col in ("current_1", "current_2", "current_3"):
+                if col in feature_index:
+                    data[idx, feature_index[col]] += rng.uniform(1.0, 2.0) * triangle
+        elif anomaly_type == "rf":
+            for col in ("rf_power_1", "rf_power_2", "snr_1", "snr_2"):
+                if col in feature_index:
+                    data[idx, feature_index[col]] -= rng.uniform(2.0, 4.0) * smooth
+        elif anomaly_type == "attitude":
+            oscillation = np.sin(np.linspace(0, 3 * np.pi, len(idx)))
+            for col in ("gyro_x", "gyro_y", "gyro_z", "mag_x", "mag_y"):
+                if col in feature_index:
+                    data[idx, feature_index[col]] += rng.uniform(1.5, 3.0) * oscillation
+        else:
+            active_cols = rng.choice(
+                list(feature_index.values()),
+                size=max(3, n_features // 4),
+                replace=False,
+            )
+            shifts = rng.uniform(1.0, 2.5, size=len(active_cols))
+            signs = rng.choice([-1.0, 1.0], size=len(active_cols))
+            data[np.ix_(idx, active_cols)] += (
+                (signs * shifts)[None, :] * smooth[:, None]
+                + rng.normal(0, 0.3, size=(len(idx), len(active_cols)))
+            )
+
+        data[idx] += rng.normal(0, 0.05, size=(len(idx), n_features))
 
     cols = FEATURE_COLUMNS[:n_features]
     df = pd.DataFrame(data, columns=cols)
