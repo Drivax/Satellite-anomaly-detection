@@ -103,9 +103,9 @@ These rolling statistics enrich each observation with local temporal context, al
 
 Low Earth Orbit satellites complete one orbit approximately every 90 minutes. At 10-second sampling, this corresponds to a period of $T = 540$ samples. To inject orbital context into the feature space without introducing a discontinuity at period boundaries, the orbital phase is encoded with sine and cosine:
 
-$$\text{orbital\_cos}_t = \cos\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
+$$\text{orbital_cos}_t = \cos\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
 
-$$\text{orbital\_sin}_t = \sin\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
+$$\text{orbital_sin}_t = \sin\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
 
 This pair uniquely identifies the position within each orbit and enables the model to learn phase-dependent normal behavior (e.g., thermal cycles caused by sun/shadow transitions).
 
