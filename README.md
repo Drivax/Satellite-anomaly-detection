@@ -9,7 +9,7 @@ Satellite telemetry is inherently high-dimensional, noisy, and temporally correl
 Two models are implemented and compared:
 
 - **Isolation Forest** — statistical baseline, tree-based unsupervised method
-- **Autoencoder** — deep learning model trained to reconstruct normal signal; anomalies surface through elevated reconstruction error
+- **Autoencoder** — deep learning model with **satellite domain-specific** feature engineering and weighted loss; anomalies surface through elevated reconstruction error
 
 Target performance metrics:
 
@@ -99,6 +99,33 @@ $$z_t = \frac{x_t - \mu_t}{\sigma_t}$$
 
 These rolling statistics enrich each observation with local temporal context, allowing both models to detect deviations relative to the recent operating regime rather than global statistics — which is essential for detecting gradual drifts.
 
+**Orbital phase encoding (LEO cyclical features):**
+
+Low Earth Orbit satellites complete one orbit approximately every 90 minutes. At 10-second sampling, this corresponds to a period of $T = 540$ samples. To inject orbital context into the feature space without introducing a discontinuity at period boundaries, the orbital phase is encoded with sine and cosine:
+
+$$\text{orbital\_cos}_t = \cos\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
+
+$$\text{orbital\_sin}_t = \sin\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
+
+This pair uniquely identifies the position within each orbit and enables the model to learn phase-dependent normal behavior (e.g., thermal cycles caused by sun/shadow transitions).
+
+**Eclipse detection:**
+
+When a LEO satellite enters Earth's shadow, its RF link quality degrades and solar power drops. Eclipse periods are detected by thresholding the mean SNR at the 25th percentile:
+
+$$\text{eclipse}_t = \mathbb{1}\!\left[\overline{\text{SNR}}_t < Q_{25}(\overline{\text{SNR}})\right]$$
+
+This binary feature allows the model to distinguish anomalies from expected eclipse-induced signal drops.
+
+**Physics-based derived features:**
+
+| Feature | Formula | Rationale |
+|---|---|---|
+| Thermal gradient | $\Delta T_{ij} = T_i - T_j$ | Heat transfer between adjacent subsystems |
+| Power estimate | $P_k = V_k \times I_k$ | Ohmic power on each rail; deviations indicate faults |
+| Gyro magnitude | $\|\omega\| = \sqrt{\omega_x^2 + \omega_y^2 + \omega_z^2}$ | Total angular rate; spikes indicate attitude instability |
+| Mag magnitude | $\|B\| = \sqrt{B_x^2 + B_y^2}$ | Geomagnetic field intensity; anomalies from sensor faults |
+
 **Chronological split:**
 
 | Set | Proportion | Purpose |
@@ -156,11 +183,23 @@ Output       20
 
 Each layer uses ReLU activation in the encoder and decoder, with a linear output layer. The bottleneck dimension of 12 forces the network to discard noise and retain only the dominant structure of normal telemetry.
 
-**Loss function:** Mean Squared Error (MSE) between input and reconstruction, summed over all $N$ samples in a batch:
+**Loss function:** Domain-weighted Mean Squared Error. Each feature dimension $j$ is assigned a weight $w_j$ reflecting the operational criticality of its subsystem:
 
-$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \| x_i - \hat{x}_i \|^2$$
+| Subsystem | Weight | Rationale |
+|---|---|---|
+| RF power, SNR | 1.5 | Mission-critical communications |
+| Voltage, Current, Power | 1.3 | Power subsystem integrity |
+| Eclipse indicator | 1.2 | Orbital context |
+| Temperature, Pressure | 1.0 | Standard housekeeping |
+| Gyro, Mag | 0.8 | Less critical for most missions |
 
-This is the per-sample reconstruction error. The same quantity, computed at inference time on a single point, is used as the anomaly score.
+The weighted MSE loss is:
+
+$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \frac{\sum_{j=1}^{d} w_j \,(x_{ij} - \hat{x}_{ij})^2}{\sum_{j=1}^{d} w_j}$$
+
+This forces the autoencoder to prioritize faithful reconstruction of mission-critical channels (communications and power), making it more sensitive to operationally dangerous anomalies while tolerating slightly higher error on less critical attitude sensors.
+
+The same weighted error, computed per-sample at inference time, is used as the anomaly score.
 
 **Training configuration:**
 

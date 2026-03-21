@@ -3,6 +3,10 @@ Preprocessing utilities for the satellite anomaly detection pipeline.
 
 Includes:
 - Min-Max normalization
+- Orbital phase encoding (LEO ~90 min cyclical features)
+- Eclipse detection from SNR
+- Physics-based features (thermal gradients, power estimates, gyro/mag magnitude)
+- Domain-weighted feature importance for sensor criticality
 - Rolling statistical features (mean, std, z-score) with window=60
 - Chronological train/validation/test split (70/15/15)
 """
@@ -29,6 +33,25 @@ FEATURE_COLUMNS = [
     "gyro_x", "gyro_y", "gyro_z",
     "mag_x", "mag_y",
 ]
+
+# --- Satellite domain constants ----------------------------------------
+ORBITAL_PERIOD_SAMPLES = 540   # LEO ~90 min at 10 s sampling
+ECLIPSE_SNR_PERCENTILE = 25    # SNR below this percentile → eclipse
+
+SENSOR_CRITICALITY = {
+    "rf_power": 1.5,
+    "snr": 1.5,
+    "voltage": 1.3,
+    "current": 1.3,
+    "power_estimate": 1.3,
+    "temperature": 1.0,
+    "thermal_gradient": 1.0,
+    "pressure": 1.0,
+    "orbital": 1.0,
+    "eclipse": 1.2,
+    "gyro": 0.8,
+    "mag": 0.8,
+}
 
 
 def minmax_normalize(df: pd.DataFrame, feature_cols: list) -> tuple:
@@ -94,6 +117,135 @@ def add_rolling_features(df: pd.DataFrame, feature_cols: list,
     return df_out
 
 
+def add_orbital_features(df: pd.DataFrame,
+                        orbital_period: int = ORBITAL_PERIOD_SAMPLES,
+                        eclipse_percentile: int = ECLIPSE_SNR_PERCENTILE
+                        ) -> pd.DataFrame:
+    """
+    Add cyclical orbital phase encoding and eclipse detection.
+
+    LEO satellites orbit Earth in ~90 minutes (540 samples at 10 s).
+    The orbital phase is encoded as sin/cos to avoid discontinuity at
+    period boundaries.  Eclipse is detected when mean SNR drops below
+    the given percentile (RF link degrades during Earth shadow).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe (sorted chronologically, already normalized).
+    orbital_period : int
+        Orbital period in samples (default 540).
+    eclipse_percentile : int
+        Percentile threshold for eclipse detection (default 25).
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with added orbital_cos, orbital_sin, and eclipse columns.
+    """
+    df_out = df.copy()
+    n = len(df_out)
+
+    # Cyclical orbital phase encoding
+    time_in_orbit = np.arange(n) % orbital_period
+    df_out["orbital_cos"] = np.cos(2 * np.pi * time_in_orbit / orbital_period)
+    df_out["orbital_sin"] = np.sin(2 * np.pi * time_in_orbit / orbital_period)
+
+    # Eclipse detection based on SNR
+    snr_cols = [c for c in df_out.columns if c.startswith("snr_")]
+    if snr_cols:
+        mean_snr = df_out[snr_cols].mean(axis=1)
+        threshold = mean_snr.quantile(eclipse_percentile / 100)
+        df_out["eclipse"] = (mean_snr < threshold).astype(float)
+
+    return df_out
+
+
+def add_physics_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add physics-based derived features specific to satellite telemetry.
+
+    - Thermal gradients between adjacent temperature sensors
+      (heat transfer between subsystems)
+    - Power estimates  P = V × I  for each voltage/current rail
+    - Gyroscope angular rate magnitude  ||ω|| = √(ωx² + ωy² + ωz²)
+    - Magnetic field magnitude  ||B|| = √(Bx² + By²)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe (sorted chronologically, already normalized).
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with added physics-based columns.
+    """
+    df_out = df.copy()
+
+    # Thermal gradients
+    if "temperature_1" in df_out.columns and "temperature_2" in df_out.columns:
+        df_out["thermal_gradient_12"] = (
+            df_out["temperature_1"] - df_out["temperature_2"]
+        )
+    if "temperature_2" in df_out.columns and "temperature_3" in df_out.columns:
+        df_out["thermal_gradient_23"] = (
+            df_out["temperature_2"] - df_out["temperature_3"]
+        )
+
+    # Power estimates  P = V × I
+    for i in range(1, 4):
+        v_col, c_col = f"voltage_{i}", f"current_{i}"
+        if v_col in df_out.columns and c_col in df_out.columns:
+            df_out[f"power_estimate_{i}"] = df_out[v_col] * df_out[c_col]
+
+    # Gyroscope angular rate magnitude
+    gyro_cols = [c for c in df_out.columns if c.startswith("gyro_")]
+    if gyro_cols:
+        df_out["gyro_magnitude"] = np.sqrt(
+            (df_out[gyro_cols] ** 2).sum(axis=1)
+        )
+
+    # Magnetic field magnitude
+    mag_cols = [c for c in df_out.columns if c.startswith("mag_")]
+    if mag_cols:
+        df_out["mag_magnitude"] = np.sqrt(
+            (df_out[mag_cols] ** 2).sum(axis=1)
+        )
+
+    return df_out
+
+
+def build_feature_weights(feature_cols: list) -> np.ndarray:
+    """
+    Build a weight vector for domain-weighted loss based on sensor criticality.
+
+    Weights reflect operational importance of each subsystem:
+      RF power, SNR     : 1.5  (mission-critical communications)
+      Voltage, Current  : 1.3  (power subsystem)
+      Eclipse indicator : 1.2  (orbital context)
+      Temperature, etc. : 1.0  (standard)
+      Gyro, Mag         : 0.8  (less critical for most missions)
+
+    Parameters
+    ----------
+    feature_cols : list of str
+        Ordered list of feature column names.
+
+    Returns
+    -------
+    np.ndarray of shape (len(feature_cols),)
+        Per-feature weight vector.
+    """
+    weights = np.ones(len(feature_cols), dtype=np.float32)
+    for i, col in enumerate(feature_cols):
+        for prefix, w in SENSOR_CRITICALITY.items():
+            if col.startswith(prefix):
+                weights[i] = w
+                break
+    return weights
+
+
 def chronological_split(df: pd.DataFrame,
                          train_ratio: float = TRAIN_RATIO,
                          val_ratio: float = VAL_RATIO) -> tuple:
@@ -131,8 +283,10 @@ def preprocess_pipeline(df: pd.DataFrame,
     """
     Full preprocessing pipeline:
       1. Min-Max normalization
-      2. Rolling feature computation
-      3. Chronological 70/15/15 split
+      2. Orbital phase encoding & eclipse detection
+      3. Physics-based feature derivation
+      4. Rolling feature computation
+      5. Chronological 70/15/15 split
 
     Parameters
     ----------
@@ -156,7 +310,9 @@ def preprocess_pipeline(df: pd.DataFrame,
         feature_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
 
     df_norm, scaler = minmax_normalize(df, feature_cols)
-    df_feat = add_rolling_features(df_norm, feature_cols, window=window)
+    df_domain = add_orbital_features(df_norm)
+    df_domain = add_physics_features(df_domain)
+    df_feat = add_rolling_features(df_domain, feature_cols, window=window)
     train, val, test = chronological_split(df_feat)
 
     all_feature_cols = feature_cols + [

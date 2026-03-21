@@ -2,10 +2,17 @@
 Autoencoder model for satellite anomaly detection (PyTorch).
 
 Architecture (symmetric):
-  Encoder: 20 → 64 → 32 → 12  (latent space)
-  Decoder: 12 → 32 → 64 → 20
+  Encoder: input_dim → 64 → 32 → latent_dim
+  Decoder: latent_dim → 32 → 64 → input_dim
 
-Loss: MSE  L = (1/N) * sum(||x - x_hat||^2)
+Loss: Domain-weighted MSE
+  L = (1/N) * sum_i sum_j [ w_j * (x_ij - x̂_ij)² ] / sum(w)
+  where w_j reflects sensor criticality
+    RF power, SNR    : 1.5
+    Voltage, Current : 1.3
+    Eclipse          : 1.2
+    Temperature      : 1.0
+    Gyro, Mag        : 0.8
 
 Anomaly threshold: 95th percentile of reconstruction error on the
 validation set. Samples with error above this threshold are anomalous.
@@ -112,6 +119,9 @@ class SatelliteAutoencoder:
     threshold_percentile : int
         Percentile of validation reconstruction error used as anomaly
         threshold (default 95).
+    feature_weights : np.ndarray or None
+        Per-feature weight vector for domain-weighted MSE loss.
+        When None, all features are weighted equally (standard MSE).
     device : str or None
         PyTorch device ('cuda', 'cpu').  Auto-detected if None.
     """
@@ -125,6 +135,7 @@ class SatelliteAutoencoder:
         batch_size: int = BATCH_SIZE,
         lr: float = LEARNING_RATE,
         threshold_percentile: int = THRESHOLD_PERCENTILE,
+        feature_weights: np.ndarray = None,
         device: str = None,
     ):
         self.epochs = epochs
@@ -145,8 +156,16 @@ class SatelliteAutoencoder:
         self.model = Autoencoder(input_dim, hidden_dims, latent_dim).to(
             self.device
         )
-        self.criterion = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        # Domain-weighted loss: per-feature weights for sensor criticality
+        if feature_weights is not None:
+            w = torch.tensor(feature_weights, dtype=torch.float32).to(
+                self.device
+            )
+            self.feature_weights_ = w / w.sum()  # normalize
+        else:
+            self.feature_weights_ = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -155,13 +174,24 @@ class SatelliteAutoencoder:
     def _to_tensor(self, X: np.ndarray) -> torch.Tensor:
         return torch.tensor(X, dtype=torch.float32).to(self.device)
 
+    def _weighted_mse(self, x: torch.Tensor, recon: torch.Tensor
+                      ) -> torch.Tensor:
+        """Compute domain-weighted MSE loss over a batch."""
+        sq = (x - recon) ** 2                        # (batch, features)
+        if self.feature_weights_ is not None:
+            sq = sq * self.feature_weights_           # broadcast weights
+        return sq.mean()
+
     def _reconstruction_error(self, X: np.ndarray) -> np.ndarray:
-        """Per-sample MSE reconstruction error."""
+        """Per-sample (weighted) MSE reconstruction error."""
         self.model.eval()
         with torch.no_grad():
             t = self._to_tensor(X)
             recon = self.model(t)
-            errors = ((t - recon) ** 2).mean(dim=1).cpu().numpy()
+            sq = (t - recon) ** 2
+            if self.feature_weights_ is not None:
+                sq = sq * self.feature_weights_
+            errors = sq.mean(dim=1).cpu().numpy()
         return errors
 
     # ------------------------------------------------------------------
@@ -196,7 +226,7 @@ class SatelliteAutoencoder:
             for (batch,) in loader:
                 self.optimizer.zero_grad()
                 recon = self.model(batch)
-                loss = self.criterion(recon, batch)
+                loss = self._weighted_mse(batch, recon)
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item() * len(batch)
