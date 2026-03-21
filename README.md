@@ -87,11 +87,11 @@ Normalization parameters are computed on the training set only and applied ident
 
 Rolling mean:
 
-$$\mu_t = \frac{1}{w} \sum_{i=t-w+1}^{t} x_i$$
+$$ \mu_t = \frac{1}{w} \sum_{i=t-w+1}^{t} x_i $$
 
 Rolling standard deviation (unbiased, Bessel-corrected):
 
-$$\sigma_t = \sqrt{\frac{1}{w-1} \sum_{i=t-w+1}^{t} (x_i - \mu_t)^2}$$
+$$ \sigma_t = \sqrt{\frac{1}{w-1} \sum_{i=t-w+1}^{t} (x_i - \mu_t)^2} $$
 
 Z-score (local standardization relative to recent history):
 
