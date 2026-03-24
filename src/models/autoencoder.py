@@ -2,8 +2,8 @@
 Autoencoder model for satellite anomaly detection (PyTorch).
 
 Architecture (symmetric):
-  Encoder: input_dim → 64 → 32 → latent_dim
-  Decoder: latent_dim → 32 → 64 → input_dim
+  Encoder: input_dim → 128 → 64 → 32 → latent_dim
+  Decoder: latent_dim → 32 → 64 → 128 → input_dim
 
 Loss: Domain-weighted MSE
   L = (1/N) * sum_i sum_j [ w_j * (x_ij - x̂_ij)² ] / sum(w)
@@ -51,16 +51,16 @@ EARLY_STOPPING_PATIENCE = 15
 class Autoencoder(nn.Module):
     """
     Symmetric Autoencoder with architecture:
-      20 → 64 → 32 → 12 → 32 → 64 → 20
+      20 → 128 → 64 → 32 → 8 → 32 → 64 → 128 → 20
 
     Parameters
     ----------
     input_dim : int
         Number of input features (default 20).
     hidden_dims : tuple of int
-        Hidden layer sizes for encoder (default (64, 32)).
+        Hidden layer sizes for encoder (default (128, 64, 32)).
     latent_dim : int
-        Bottleneck/latent space dimension (default 12).
+        Bottleneck/latent space dimension (default 8).
     """
 
     def __init__(

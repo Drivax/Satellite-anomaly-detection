@@ -2,59 +2,169 @@
 
 ## Project Objective
 
-This project implements two unsupervised anomaly detection approaches on multivariate time-series telemetry data from satellites: temperature, voltage, current, RF power, signal-to-noise ratio, and related hardware indicators. The objective is to detect failures or performance degradations in real time, before they become operationally critical.
+Satellites generate continuous streams of telemetry — temperature readings, voltage levels, RF signal quality, attitude sensor data — and somewhere in that stream, failures are hiding. This project builds two unsupervised models to find them before they become critical.
 
-Satellite telemetry is inherently high-dimensional, noisy, and temporally correlated. Classical threshold-based monitoring fails to capture cross-channel dependencies or gradual drifts. The approach here treats anomaly detection as a density estimation and reconstruction problem, using both a statistical baseline and a deep learning model trained exclusively on normal operating data.
-
-Two models are implemented and compared:
-
-- **Isolation Forest** — statistical baseline, tree-based unsupervised method
-- **Autoencoder** — deep learning model with **satellite domain-specific** feature engineering and weighted loss; anomalies surface through elevated reconstruction error
-
-Target performance metrics (based on synthetic benchmark):
-
-| Metric | Target |
-|---|---|
-| Precision | >= 0.50 |
-| Recall | >= 0.40 |
-| F1-score | >= 0.45 |
-| ROC-AUC | >= 0.80 |
-
-These results are measured on synthetic telemetry modelled after the OPSSAT-AD dataset.
+The idea is straightforward. Train models only on normal operating data, then flag anything that looks different. Two approaches are compared: an Isolation Forest as a statistical baseline, and a PyTorch autoencoder with domain-specific feature engineering. Both are evaluated on synthetic telemetry modelled after the ESA OPS-SAT nanosatellite dataset.
 
 ---
 
 ## Dataset
 
-The OPSSAT-AD dataset contains multivariate time-series recorded aboard the ESA OPSSAT nanosatellite. Each observation is a 20-dimensional vector sampled at 10-second intervals, covering:
+The pipeline is designed for the [OPS-SAT Anomaly Detection dataset](https://zenodo.org/records/12771689), a multivariate time series recorded aboard ESA's OPS-SAT nanosatellite. Each observation is a 20-dimensional vector sampled every 10 seconds.
 
-- Thermal sensors (on-board computer, battery, solar panels)
-- Power bus voltage and current rails
-- RF transmit power and received signal-to-noise ratio
-- Attitude control and reaction wheel housekeeping
+The features cover four subsystems:
 
-Key statistics:
+- **Thermal** — on-board computer, battery, and solar panel temperatures
+- **Power** — bus voltage and current rails (3 channels each)
+- **Communications** — RF transmit power and signal-to-noise ratio
+- **Attitude** — gyroscope (3 axes), magnetometer (2 axes), pressure sensors
 
-- Total time points: approximately 120,000
-- Number of features: 20
-- Anomaly rate: 3.8 % (label 0 = normal, label 1 = anomaly)
-- Anomalies include: thermal excursions, power rail drops, RF link degradation, attitude instability
+Key numbers: ~120,000 time points, 20 features, 3.8% anomaly rate. Anomalies include thermal excursions, power drops, RF degradation, and attitude instability.
 
-Place the dataset CSV or Parquet file in the `data/` directory. The file is not committed to the repository.
-
-**Exploratory visualizations:**
-
-Sample telemetry window:
+A synthetic data generator is included for development and testing. Place the real dataset in the `data/` directory (not committed to the repository).
 
 ![Telemetry sample](results/eda_time_series_sample.png)
 
-Feature distributions:
-
 ![Feature distributions](results/eda_feature_distributions.png)
 
-Correlation heatmap:
-
 ![Correlation heatmap](results/eda_correlation_heatmap.png)
+
+---
+
+## Methodology
+
+### 1. Preprocessing
+
+All preprocessing respects chronological order. No shuffling, anywhere. Shuffling a time series leaks future information into training and silently inflates metrics.
+
+**Normalization.** Min-Max scaling brings every feature into [0, 1]. The scaler is fitted on the training set only, then applied identically to validation and test sets.
+
+**Rolling statistics.** For each feature, a 60-point sliding window (~10 minutes) computes the rolling mean, rolling standard deviation, and a local z-score. This gives each sample context about its recent history, which is critical for catching slow drifts that look normal in isolation.
+
+**Orbital phase encoding.** A low Earth orbit takes about 90 minutes — 540 samples at 10-second intervals. The position within each orbit is encoded as a sine-cosine pair, which avoids the jump that a simple modulo counter would create. This lets the model learn that certain behaviors are normal at specific orbital phases (e.g., temperature swings during sun/shadow transitions).
+
+**Eclipse detection.** When the satellite enters Earth's shadow, solar power drops and RF quality degrades. This is normal, not an anomaly. Eclipse periods are flagged by thresholding the mean SNR at its 25th percentile on the training set, giving the models a way to distinguish expected eclipse effects from real faults.
+
+**Physics-based features.** Four derived features encode domain knowledge directly:
+
+| Feature | What it captures |
+|---|---|
+| Thermal gradient ($T_i - T_j$) | Heat flow between adjacent subsystems |
+| Power estimate ($V \times I$) | Ohmic power per rail — deviations signal faults |
+| Gyro magnitude ($\sqrt{\omega_x^2 + \omega_y^2 + \omega_z^2}$) | Total rotation rate — spikes mean attitude problems |
+| Mag magnitude ($\sqrt{B_x^2 + B_y^2}$) | Geomagnetic field intensity — anomalies point to sensor issues |
+
+**Data split.** 70% train / 15% validation / 15% test, in strict chronological order.
+
+![Rolling preprocessing features](results/preprocessing_rolling_features.png)
+
+### 2. Isolation Forest (Baseline)
+
+Isolation Forest works on a simple insight: anomalies are rare and different, so they are easy to separate. The algorithm builds an ensemble of random trees. At each node, it picks a random feature and a random split. Points that get isolated in few splits are likely anomalies — they sit in sparse regions of the feature space.
+
+Hyperparameters: 200 trees, contamination set to 0.038 (matching the known anomaly rate), 80% sub-sampling per tree.
+
+```python
+from src.models.isolation_forest import SatelliteIsolationForest
+
+model = SatelliteIsolationForest()
+model.fit(X_train)
+metrics = model.evaluate(X_test, y_test)
+```
+
+![Isolation Forest score distribution](results/if_score_distribution.png)
+
+![Isolation Forest ROC curve](results/if_roc_curve.png)
+
+### 3. Autoencoder (PyTorch)
+
+The autoencoder is a neural network trained to compress normal telemetry into a small latent space and then reconstruct it. If a new sample is normal, reconstruction is accurate. If it is anomalous, the network struggles and the reconstruction error spikes — that error becomes the anomaly score.
+
+**Architecture.** A symmetric encoder-decoder with ReLU activations:
+
+```
+Encoder:  20 → 128 → 64 → 32 → 8  (latent space)
+Decoder:   8 →  32 → 64 → 128 → 20
+```
+
+The bottleneck of 8 dimensions forces the network to learn only the dominant structure of normal operations, discarding noise.
+
+**Domain-weighted loss.** Not all sensors matter equally. RF and power channels are mission-critical, so their reconstruction errors are weighted more heavily (1.5x for communications, 1.3x for power, 0.8x for attitude sensors). This makes the model more sensitive to the anomalies that actually matter operationally.
+
+**Training.** Adam optimizer, learning rate $5 \times 10^{-4}$ with weight decay $10^{-5}$, batch size 128, up to 120 epochs. A ReduceLROnPlateau scheduler halves the learning rate after 5 stagnant epochs, and early stopping (patience 15) prevents overfitting.
+
+**Threshold.** After training, the reconstruction error is computed on the validation set. The 95th percentile of that distribution becomes the decision boundary — anything above it is flagged as anomalous.
+
+```python
+from src.models.autoencoder import SatelliteAutoencoder
+
+model = SatelliteAutoencoder(input_dim=20)
+model.fit(X_train, X_val)
+metrics = model.evaluate(X_test, y_test)
+```
+
+![Autoencoder training curve](results/ae_training_curve.png)
+
+![Reconstruction error histogram](results/reconstruction_error_hist.png)
+
+![Autoencoder ROC curve](results/roc_curve.png)
+
+---
+
+## Key Equations
+
+**Min-Max normalization** — scales each feature to [0, 1]:
+
+$$x' = \frac{x - x_{\min}}{x_{\max} - x_{\min}}$$
+
+Each value is shifted by its minimum and divided by its range. Simple, but the key rule is: fit the scaler on training data only.
+
+**Rolling z-score** — measures how far a value deviates from its recent history:
+
+$$z_t = \frac{x_t - \mu_t}{\sigma_t}$$
+
+where $\mu_t$ and $\sigma_t$ are the mean and standard deviation over the last $w = 60$ samples. A z-score of 3 means the current reading is 3 standard deviations away from what was normal in the past 10 minutes.
+
+**Orbital phase encoding** — maps the satellite's orbit position to a smooth, continuous representation:
+
+$$\text{orbital\_cos}_t = \cos\!\left(\frac{2\pi\,(t \bmod T)}{T}\right), \quad \text{orbital\_sin}_t = \sin\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
+
+where $T = 540$ samples (~90 minutes). The sin-cos pair avoids the discontinuity that a raw counter would have at period boundaries.
+
+**Isolation Forest anomaly score** — how easily a point can be separated from the rest:
+
+$$s(x, n) = 2^{-E[h(x)] \,/\, c(n)}$$
+
+$E[h(x)]$ is the average tree depth needed to isolate $x$, and $c(n)$ normalizes by the expected depth for $n$ samples. Scores near 1 are anomalies; scores near 0.5 are ambiguous; scores near 0 are clearly normal.
+
+**Weighted MSE loss** — the autoencoder's training objective, emphasizing critical subsystems:
+
+$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \frac{\sum_{j=1}^{d} w_j \,(x_{ij} - \hat{x}_{ij})^2}{\sum_{j=1}^{d} w_j}$$
+
+Each feature $j$ has a weight $w_j$ reflecting how important that sensor is. The same weighted error, computed per sample at inference, serves as the anomaly score.
+
+**Anomaly threshold** — calibrated on the validation set:
+
+$$\tau = \text{Percentile}_{95}\!\left(\left\lbrace \mathcal{L}_i \right\rbrace_{i \in \text{val}}\right)$$
+
+Any test sample with reconstruction error above $\tau$ is classified as anomalous. The 95th percentile means roughly 5% of normal validation samples will be flagged — a deliberate trade-off between sensitivity and false alarms.
+
+---
+
+## Evaluation
+
+Both models are evaluated on the held-out test set (15% of data, strictly after training and validation in time). Metrics used: precision, recall, F1-score, and ROC-AUC.
+
+| Model | Precision | Recall | F1-score | ROC-AUC |
+|---|---|---|---|---|
+| Isolation Forest | 0.2727 | 0.3078 | 0.2892 | 0.7569 |
+| **Autoencoder** | **0.5342** | **0.4446** | **0.4853** | **0.8207** |
+
+The autoencoder roughly doubles the Isolation Forest's precision and F1, and gains 6 points on AUC. The main reason: the rolling features and domain-weighted loss give the autoencoder temporal context and operational awareness that a pointwise tree-based method simply cannot capture.
+
+The Isolation Forest is still useful as a fast, interpretable sanity check. But for operational deployment, the autoencoder is the clear choice.
+
+![Model comparison](results/model_comparison.png)
 
 ---
 
@@ -62,246 +172,38 @@ Correlation heatmap:
 
 ```
 satellite-anomaly-detection/
-├── data/                        # OPSSAT-AD dataset (not committed)
+├── data/                         # OPS-SAT dataset (not committed)
 ├── notebooks/
-│   ├── 01_eda.ipynb             # Exploratory Data Analysis
-│   ├── 02_preprocessing.ipynb  # Normalization, rolling features, split
-│   ├── 03_isolation_forest.ipynb
-│   ├── 04_autoencoder.ipynb
-│   └── 05_results.ipynb        # Side-by-side model comparison
+│   ├── 01_eda.ipynb              # Exploratory data analysis
+│   ├── 02_preprocessing.ipynb    # Normalization, rolling features, split
+│   ├── 03_isolation_forest.ipynb # Baseline model
+│   ├── 04_autoencoder.ipynb      # Deep learning model
+│   └── 05_results.ipynb          # Side-by-side comparison
 ├── src/
 │   ├── models/
-│   │   ├── isolation_forest.py  # SatelliteIsolationForest wrapper
-│   │   └── autoencoder.py       # SatelliteAutoencoder (PyTorch)
+│   │   ├── isolation_forest.py   # SatelliteIsolationForest wrapper
+│   │   └── autoencoder.py        # SatelliteAutoencoder (PyTorch)
 │   └── utils/
-│       └── preprocessing.py     # Normalization, rolling features, split
-├── app.py                       # Streamlit dashboard
-├── requirements.txt
-└── results/
-    ├── roc_curve.png
-    ├── reconstruction_error_hist.png
-    └── model_comparison.png
+│       └── preprocessing.py      # Full preprocessing pipeline
+├── results/                      # Saved plots and figures
+├── app.py                        # Streamlit dashboard
+└── requirements.txt
 ```
 
 ---
 
-## Methodology
-
-### 1. Data Preprocessing
-
-All processing strictly respects the chronological order of the time series. No shuffling is applied at any stage, as shuffling would introduce data leakage from the future into the training set and invalidate temporal dependencies.
-
-**Min-Max normalization** is applied per feature to bring all channels into [0, 1]:
-
-$$x' = \frac{x - x_{\min}}{x_{\max} - x_{\min}}$$
-
-Normalization parameters are computed on the training set only and applied identically to the validation and test sets, preventing any leakage from held-out data.
-
-**Rolling features** are computed with a window of $w = 60$ points (equivalent to 10 minutes at 10-second sampling). For each feature and each time step $t$:
-
-Rolling mean:
-
-$$ \mu_t = \frac{1}{w} \sum_{i=t-w+1}^{t} x_i $$
-
-Rolling standard deviation (unbiased, Bessel-corrected):
-
-$$ \sigma_t = \sqrt{\frac{1}{w-1} \sum_{i=t-w+1}^{t} (x_i - \mu_t)^2} $$
-
-Z-score (local standardization relative to recent history):
-
-$$z_t = \frac{x_t - \mu_t}{\sigma_t}$$
-
-These rolling statistics enrich each observation with local temporal context, allowing both models to detect deviations relative to the recent operating regime rather than global statistics — which is essential for detecting gradual drifts.
-
-**Orbital phase encoding (LEO cyclical features):**
-
-Low Earth Orbit satellites complete one orbit approximately every 90 minutes. At 10-second sampling, this corresponds to a period of $T = 540$ samples. To inject orbital context into the feature space without introducing a discontinuity at period boundaries, the orbital phase is encoded with sine and cosine:
-
-$$\text{orbital}_{\text{cos},\,t} = \cos\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
-
-$$\text{orbital}_{\text{sin},\,t} = \sin\!\left(\frac{2\pi\,(t \bmod T)}{T}\right)$$
-
-This pair uniquely identifies the position within each orbit and enables the model to learn phase-dependent normal behavior (e.g., thermal cycles caused by sun/shadow transitions).
-
-**Eclipse detection:**
-
-When a LEO satellite enters Earth's shadow, its RF link quality degrades and solar power drops. Eclipse periods are detected by thresholding the mean SNR at the 25th percentile:
-
-$$\text{eclipse}_t = \mathbb{1}\!\left[\overline{\text{SNR}}_t < Q_{25}(\overline{\text{SNR}})\right]$$
-
-This binary feature allows the model to distinguish anomalies from expected eclipse-induced signal drops.
-
-**Physics-based derived features:**
-
-| Feature | Formula | Rationale |
-|---|---|---|
-| Thermal gradient | $\Delta T_{ij} = T_i - T_j$ | Heat transfer between adjacent subsystems |
-| Power estimate | $P_k = V_k \times I_k$ | Ohmic power on each rail; deviations indicate faults |
-| Gyro magnitude | $\|\omega\| = \sqrt{\omega_x^2 + \omega_y^2 + \omega_z^2}$ | Total angular rate; spikes indicate attitude instability |
-| Mag magnitude | $\|B\| = \sqrt{B_x^2 + B_y^2}$ | Geomagnetic field intensity; anomalies from sensor faults |
-
-**Chronological split:**
-
-| Set | Proportion | Purpose |
-|---|---|---|
-| Train | 70 % | Model fitting |
-| Validation | 15 % | Threshold calibration, early stopping |
-| Test | 15 % | Final evaluation |
-
-Rolling-feature example:
-
-![Rolling preprocessing features](results/preprocessing_rolling_features.png)
-
----
-
-### 2. Baseline Model: Isolation Forest
-
-Isolation Forest (Liu et al., 2008) is an unsupervised anomaly detection algorithm operating on the principle that anomalies are statistically rare and lie in sparse regions of the feature space. They are therefore easier to isolate through random recursive partitioning.
-
-**Construction:** An ensemble of $T$ isolation trees is built. Each tree is grown by randomly selecting a feature and a random split value within the observed range of that feature, recursively, until each point is isolated in its own leaf.
-
-**Anomaly score:** The isolation depth $h(x)$ for a point $x$ is the number of splits required to isolate it. Normal points require many splits (they are deep in dense clusters); anomalies require few splits (they are separated early in sparse regions). The normalized anomaly score is:
-
-$$s(x, n) = 2^{-\frac{E[h(x)]}{c(n)}}$$
-
-where:
-- $E[h(x)]$ is the expected isolation depth averaged over all $T$ trees
-- $c(n) = 2H(n-1) - \frac{2(n-1)}{n}$ is the expected depth of an unsuccessful search in a binary search tree over $n$ samples, with $H(k) = \ln(k) + \gamma$ (Euler-Mascheroni constant $\gamma \approx 0.5772$)
-- $s(x) \to 1$ indicates an anomaly; $s(x) \to 0$ indicates a normal point; $s(x) \approx 0.5$ is ambiguous
-
-**Hyperparameters:**
-
-| Parameter | Value | Rationale |
-|---|---|---|
-| `n_estimators` | 200 | Sufficient for score stability |
-| `contamination` | 0.038 | Matches the empirical anomaly rate |
-| `max_samples` | 0.8 | Sub-sampling reduces variance, improves isolation |
-
-```python
-from src.models.isolation_forest import SatelliteIsolationForest
-model = SatelliteIsolationForest()
-model.fit(X_train)
-metrics = model.evaluate(X_test, y_test)
-```
-
-Isolation Forest anomaly-score distribution:
-
-![Isolation Forest score distribution](results/if_score_distribution.png)
-
-Isolation Forest ROC curve:
-
-![Isolation Forest ROC curve](results/if_roc_curve.png)
-
----
-
-### 3. Advanced Model: Autoencoder (PyTorch)
-
-An autoencoder is a neural network trained to map an input $x$ to a low-dimensional latent representation $z$, then reconstruct $\hat{x}$ from $z$. Trained exclusively on normal data, it learns a compact manifold of normal operating states. When an anomalous input is presented, the network cannot reconstruct it faithfully, producing a high reconstruction error that serves as the anomaly score.
-
-**Architecture (symmetric encoder-decoder):**
-
-```
-Input        20
-Encoder:     20  ->  64  ->  32  ->  12   (latent space)
-Decoder:     12  ->  32  ->  64  ->  20
-Output       20
-```
-
-Each layer uses ReLU activation in the encoder and decoder, with a linear output layer. The bottleneck dimension of 12 forces the network to discard noise and retain only the dominant structure of normal telemetry.
-
-**Loss function:** Domain-weighted Mean Squared Error. Each feature dimension $j$ is assigned a weight $w_j$ reflecting the operational criticality of its subsystem:
-
-| Subsystem | Weight | Rationale |
-|---|---|---|
-| RF power, SNR | 1.5 | Mission-critical communications |
-| Voltage, Current, Power | 1.3 | Power subsystem integrity |
-| Eclipse indicator | 1.2 | Orbital context |
-| Temperature, Pressure | 1.0 | Standard housekeeping |
-| Gyro, Mag | 0.8 | Less critical for most missions |
-
-The weighted MSE loss is:
-
-$$\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \frac{\sum_{j=1}^{d} w_j \,(x_{ij} - \hat{x}_{ij})^2}{\sum_{j=1}^{d} w_j}$$
-
-This forces the autoencoder to prioritize faithful reconstruction of mission-critical channels (communications and power), making it more sensitive to operationally dangerous anomalies while tolerating slightly higher error on less critical attitude sensors.
-
-The same weighted error, computed per-sample at inference time, is used as the anomaly score.
-
-**Training configuration:**
-
-| Parameter | Value |
-|---|---|
-| Epochs | 50 |
-| Optimizer | Adam |
-| Learning rate | $10^{-3}$ |
-| Batch size | 128 |
-
-**Anomaly threshold:** After training, the reconstruction error is computed on every sample in the validation set (which contains only normal points). The decision threshold $\tau$ is set to the 95th percentile of this distribution:
-
-$$\tau = \text{Percentile}_{95}\left(\{ \| x_i - \hat{x}_i \|^2 \}_{i \in \text{val}} \right)$$
-
-A test point $x$ is classified as anomalous if and only if $\| x - \hat{x} \|^2 > \tau$.
-
-```python
-from src.models.autoencoder import SatelliteAutoencoder
-model = SatelliteAutoencoder(input_dim=20, epochs=50)
-model.fit(X_train, X_val)
-metrics = model.evaluate(X_test, y_test)
-```
-
-Autoencoder training curve:
-
-![Autoencoder training curve](results/ae_training_curve.png)
-
-Reconstruction-error distribution:
-
-![Reconstruction error histogram](results/reconstruction_error_hist.png)
-
-Autoencoder ROC curve:
-
-![Autoencoder ROC curve](results/roc_curve.png)
-
----
-
-### 4. Evaluation
-
-All models are evaluated on the held-out test set. Labels are binary: 0 (normal), 1 (anomaly). The following metrics are computed:
-
-$$\text{Precision} = \frac{TP}{TP + FP}$$
-
-$$\text{Recall} = \frac{TP}{TP + FN}$$
-
-$$\text{F1} = 2 \cdot \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$$
-
-$$\text{ROC-AUC} = \int_0^1 \text{TPR}(t) \, d\text{FPR}(t)$$
-
-where $TP$ = true positives, $FP$ = false positives, $FN$ = false negatives, and the ROC-AUC integrates the true positive rate over all possible decision thresholds.
-
-**Results:**
-
-| Model | Precision | Recall | F1-score | ROC-AUC |
-|---|---|---|---|---|
-| Isolation Forest | 0.2727 | 0.3078 | 0.2892 | 0.7569 |
-| **Autoencoder** | **0.5342** | **0.4446** | **0.4853** | **0.8207** |
-
-The autoencoder outperforms Isolation Forest across all metrics (ROC-AUC 0.82 vs 0.76, F1 0.49 vs 0.29). The autoencoder's sequence-window approach captures temporal reconstruction patterns that the pointwise Isolation Forest cannot model, yielding nearly double precision and significantly higher AUC.
-
-![Model comparison](results/model_comparison.png)
-
----
-
-## Installation and Usage
+## Installation and Execution
 
 ```bash
 pip install -r requirements.txt
+```
 
+Launch the interactive dashboard:
+
+```bash
 streamlit run app.py
 ```
 
-The Streamlit dashboard provides:
-- Real-time visualization of multivariate telemetry channels
-- Detected anomaly markers overlaid on the time series
-- Reconstruction error distribution and score histograms
-- Side-by-side metrics comparison between both models
+The dashboard lets you generate synthetic data, run both models, and compare their results side by side — anomaly overlays on telemetry, score distributions, and metrics.
 
-A synthetic generator (`src.utils.preprocessing.generate_synthetic_dataset`) is provided for development and testing.
+To use the real OPS-SAT dataset, place the CSV or Parquet file in the `data/` directory and load it through the notebook pipeline (`01_eda.ipynb` onward).
