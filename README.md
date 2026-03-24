@@ -127,10 +127,10 @@ where $\mu_t$ and $\sigma_t$ are the mean and standard deviation over the last $
 
 **Orbital phase encoding** — maps the satellite's orbit position to a smooth, continuous representation:
 
-\[
+$$
 \text{orbital\_cos}_t = \cos\left( \frac{2\pi \, (t \bmod T)}{T} \right), \quad
 \text{orbital\_sin}_t = \sin\left( \frac{2\pi \, (t \bmod T)}{T} \right)
-\]
+$$
 where $T = 540$ samples (~90 minutes). The sin-cos pair avoids the discontinuity that a raw counter would have at period boundaries.
 
 **Isolation Forest anomaly score** — how easily a point can be separated from the rest:
