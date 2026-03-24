@@ -125,14 +125,6 @@ $$z_t = \frac{x_t - \mu_t}{\sigma_t}$$
 
 where $\mu_t$ and $\sigma_t$ are the mean and standard deviation over the last $w = 60$ samples. A z-score of 3 means the current reading is 3 standard deviations away from what was normal in the past 10 minutes.
 
-**Orbital phase encoding** — maps the satellite's orbit position to a smooth, continuous representation:
-
-$$
-\text{orbital\_cos}_t = \cos\left( \frac{2\pi \, (t \bmod T)}{T} \right), \quad
-\text{orbital\_sin}_t = \sin\left( \frac{2\pi \, (t \bmod T)}{T} \right)
-$$
-where $T = 540$ samples (~90 minutes). The sin-cos pair avoids the discontinuity that a raw counter would have at period boundaries.
-
 **Isolation Forest anomaly score** — how easily a point can be separated from the rest:
 
 $$s(x, n) = 2^{-E[h(x)] \,/\, c(n)}$$
